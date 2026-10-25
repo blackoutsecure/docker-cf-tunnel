@@ -1,0 +1,276 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# init-cf-tunnel-config
+# ---------------------
+# Validates the user's configuration and prepares the runtime state in
+# /run/cf-tunnel/ so that svc-cf-tunnel/run can construct the cloudflared
+# argv with no further branching.
+#
+# Outputs (all in /run/cf-tunnel/, tmpfs):
+#   mode         -- "quick" | "token" | "config"
+#   url          -- (quick mode) the upstream service URL to expose
+#   token        -- (token mode) the resolved tunnel token (chmod 0600)
+#   config-file  -- (config mode) absolute path to config.yml
+#   tunnel-id    -- (config mode) tunnel name OR UUID for `cloudflared tunnel run`
+#   credentials  -- (config mode) absolute path to credentials JSON file
+#   origin-cert  -- (optional)    absolute path to /config/cert.pem
+#
+# Exits non-zero on any validation failure -- this halts container startup.
+#
+set -uo pipefail
+
+STATE_DIR="/run/cf-tunnel"
+CONFIG_DIR="/config"
+
+_log_severity() {
+    case "${1,,}" in
+        debug) echo 10 ;; info) echo 20 ;; warn) echo 30 ;;
+        error) echo 40 ;; fatal) echo 50 ;; *) echo 20 ;;
+    esac
+}
+
+log() {
+    local level="$1"; shift
+    local cur min
+    cur=$(_log_severity "${level}")
+    min=$(_log_severity "${LOG_LEVEL:-info}")
+    if [[ "${level,,}" != "fatal" && "${cur}" -lt "${min}" ]]; then
+        return 0
+    fi
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') init-cf-tunnel-config[${level}]: $*"
+}
+
+die() {
+    log "fatal" "$@"
+    exit 1
+}
+
+_strip() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "${s}"; }
+
+# _resolve_file_secret VAR_NAME
+#   If $VAR_NAME is set & non-empty -> use as-is.
+#   Else if ${VAR_NAME}_FILE is set -> read the contents (trimmed).
+#   Else -> empty.
+# Echoes the resolved value on stdout.
+_resolve_file_secret() {
+    local base="$1"
+    local file_var="${base}_FILE"
+    local val="${!base:-}"
+    local file_path="${!file_var:-}"
+
+    val="$(_strip "${val}")"
+    file_path="$(_strip "${file_path}")"
+
+    if [[ -n "${val}" ]]; then
+        printf '%s' "${val}"
+        return 0
+    fi
+    if [[ -n "${file_path}" ]]; then
+        if [[ ! -f "${file_path}" ]]; then
+            die "${file_var}=${file_path} does not exist or is not a regular file"
+        fi
+        if [[ ! -r "${file_path}" ]]; then
+            die "${file_var}=${file_path} is not readable by the current user (uid=$(id -u))"
+        fi
+        # Strip a single trailing newline only (preserve internal whitespace).
+        local content
+        content="$(cat "${file_path}")"
+        printf '%s' "${content}"
+        return 0
+    fi
+    printf ''
+}
+
+# Always start with a clean tmpfs state dir owned by abc.
+rm -rf "${STATE_DIR}"
+mkdir -p "${STATE_DIR}"
+chmod 0750 "${STATE_DIR}"
+chown abc:abc "${STATE_DIR}" 2>/dev/null || true
+
+# Ensure /config exists and is writable by abc. The mount might be a
+# fresh empty volume on first start.
+if [[ ! -d "${CONFIG_DIR}" ]]; then
+    mkdir -p "${CONFIG_DIR}"
+fi
+if ! ( : > "${CONFIG_DIR}/.rw-probe.$$" ) 2>/dev/null; then
+    log "warn" "${CONFIG_DIR} is not writable -- token-only and quick modes will still work, but quick-url.txt cannot be persisted"
+else
+    rm -f "${CONFIG_DIR}/.rw-probe.$$"
+    chown abc:abc "${CONFIG_DIR}" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve TUNNEL_MODE.
+# ---------------------------------------------------------------------------
+TUNNEL_MODE="$(_strip "${TUNNEL_MODE:-}")"
+
+# Auto-detect when the user didn't set TUNNEL_MODE explicitly: token wins
+# over config wins over quick-with-url. This mirrors how most users will
+# expect a single env-var set to "just work".
+if [[ -z "${TUNNEL_MODE}" ]]; then
+    if [[ -n "$(_strip "${TUNNEL_TOKEN:-}")" || -n "$(_strip "${TUNNEL_TOKEN_FILE:-}")" ]]; then
+        TUNNEL_MODE="token"
+        log "info" "TUNNEL_MODE not set; auto-detected 'token' from TUNNEL_TOKEN"
+    elif [[ -n "$(_strip "${TUNNEL_CONFIG_FILE:-}")" ]] || [[ -f "${CONFIG_DIR}/config.yml" ]] || [[ -f "${CONFIG_DIR}/config.yaml" ]]; then
+        TUNNEL_MODE="config"
+        log "info" "TUNNEL_MODE not set; auto-detected 'config' from TUNNEL_CONFIG_FILE / ${CONFIG_DIR}/config.yml"
+    elif [[ -n "$(_strip "${TUNNEL_URL:-}")" ]]; then
+        TUNNEL_MODE="quick"
+        log "info" "TUNNEL_MODE not set; auto-detected 'quick' from TUNNEL_URL"
+    else
+        die "No TUNNEL_MODE set and no auto-detect signals found. Set TUNNEL_MODE to one of: quick, token, config (see README)."
+    fi
+fi
+
+case "${TUNNEL_MODE,,}" in
+    quick|token|config) TUNNEL_MODE="${TUNNEL_MODE,,}" ;;
+    *) die "Invalid TUNNEL_MODE='${TUNNEL_MODE}'. Allowed: quick, token, config." ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Mode-specific validation.
+# ---------------------------------------------------------------------------
+echo "${TUNNEL_MODE}" > "${STATE_DIR}/mode"
+chmod 0644 "${STATE_DIR}/mode"
+
+case "${TUNNEL_MODE}" in
+    quick)
+        TUNNEL_URL="$(_strip "${TUNNEL_URL:-}")"
+        if [[ -z "${TUNNEL_URL}" ]]; then
+            die "TUNNEL_MODE=quick requires TUNNEL_URL (the upstream service to expose, e.g. http://app:8080)"
+        fi
+        # Sanity-check the URL shape -- cloudflared accepts http(s)://, tcp://, ssh://, etc.
+        # but we reject the obvious typos early.
+        if ! [[ "${TUNNEL_URL}" =~ ^(https?|tcp|ssh|rdp|smb|unix|http_status)://.+ ]]; then
+            log "warn" "TUNNEL_URL='${TUNNEL_URL}' does not look like a typical cloudflared URL (expected http(s)://, tcp://, ssh://, ...). Passing through anyway."
+        fi
+        echo "${TUNNEL_URL}" > "${STATE_DIR}/url"
+        chmod 0644 "${STATE_DIR}/url"
+        log "info" "Quick tunnel mode: will expose ${TUNNEL_URL} via *.trycloudflare.com"
+        log "info" "NOTE: quick tunnels are EPHEMERAL. The URL changes every restart. Use 'token' or 'config' mode for a stable hostname."
+        ;;
+
+    token)
+        local_token="$(_resolve_file_secret TUNNEL_TOKEN)"
+        if [[ -z "${local_token}" ]]; then
+            die "TUNNEL_MODE=token requires TUNNEL_TOKEN (or TUNNEL_TOKEN_FILE pointing to a file containing the token)"
+        fi
+        # Validate token shape: cloudflared tunnel tokens are URL-safe base64.
+        # We don't enforce length, but reject obvious copy-paste with whitespace
+        # in the middle (a common error from dashboard copy buttons).
+        if [[ "${local_token}" =~ [[:space:]] ]]; then
+            log "warn" "TUNNEL_TOKEN appears to contain whitespace; this is usually a copy/paste error. Stripping internal whitespace."
+            local_token="$(echo -n "${local_token}" | tr -d '[:space:]')"
+        fi
+        umask 077
+        printf '%s\n' "${local_token}" > "${STATE_DIR}/token"
+        chmod 0600 "${STATE_DIR}/token"
+        chown abc:abc "${STATE_DIR}/token" 2>/dev/null || true
+        log "info" "Token tunnel mode: token loaded ($(echo -n "${local_token}" | wc -c) bytes)"
+        ;;
+
+    config)
+        cfg="$(_strip "${TUNNEL_CONFIG_FILE:-}")"
+        if [[ -z "${cfg}" ]]; then
+            for candidate in "${CONFIG_DIR}/config.yml" "${CONFIG_DIR}/config.yaml"; do
+                if [[ -f "${candidate}" ]]; then
+                    cfg="${candidate}"
+                    break
+                fi
+            done
+        fi
+        if [[ -z "${cfg}" ]]; then
+            die "TUNNEL_MODE=config requires TUNNEL_CONFIG_FILE (or place config.yml/config.yaml in ${CONFIG_DIR})"
+        fi
+        if [[ ! -f "${cfg}" ]]; then
+            die "TUNNEL_CONFIG_FILE='${cfg}' does not exist or is not a regular file"
+        fi
+        if [[ ! -r "${cfg}" ]]; then
+            die "TUNNEL_CONFIG_FILE='${cfg}' is not readable by the cloudflared user (abc, uid 911)"
+        fi
+        echo "${cfg}" > "${STATE_DIR}/config-file"
+
+        tid="$(_strip "${TUNNEL_NAME:-}")"
+        if [[ -z "${tid}" ]]; then
+            tid="$(_strip "${TUNNEL_ID:-}")"
+        fi
+        # If neither is set, cloudflared will look at the `tunnel:` key in
+        # the config.yml, which is fine. We only emit one if provided.
+        if [[ -n "${tid}" ]]; then
+            echo "${tid}" > "${STATE_DIR}/tunnel-id"
+        fi
+
+        # Materialise credentials JSON, either from explicit path or from
+        # an inline string (TUNNEL_CREDENTIALS_CONTENTS / _FILE for secret
+        # injection). cloudflared expects the file to exist on disk and
+        # be referenced from config.yml's `credentials-file:` key.
+        creds="$(_strip "${TUNNEL_CREDENTIALS_FILE:-}")"
+        creds_contents="$(_resolve_file_secret TUNNEL_CREDENTIALS_CONTENTS)"
+        if [[ -n "${creds_contents}" ]]; then
+            # Default landing path inside /config so it survives restarts.
+            target="${creds:-${CONFIG_DIR}/$(_strip "${TUNNEL_ID:-tunnel}").json}"
+            mkdir -p "$(dirname "${target}")"
+            umask 077
+            printf '%s' "${creds_contents}" > "${target}"
+            chmod 0600 "${target}"
+            chown abc:abc "${target}" 2>/dev/null || true
+            log "info" "Materialised tunnel credentials from TUNNEL_CREDENTIALS_CONTENTS to ${target}"
+            creds="${target}"
+        fi
+        if [[ -n "${creds}" ]]; then
+            if [[ ! -f "${creds}" ]]; then
+                die "TUNNEL_CREDENTIALS_FILE='${creds}' does not exist"
+            fi
+            if [[ ! -r "${creds}" ]]; then
+                die "TUNNEL_CREDENTIALS_FILE='${creds}' is not readable by abc (uid 911). chown the file to 911:911 or chmod 0644."
+            fi
+            echo "${creds}" > "${STATE_DIR}/credentials"
+        else
+            log "warn" "No TUNNEL_CREDENTIALS_FILE provided; cloudflared will rely on credentials-file: in ${cfg} or the default ~/.cloudflared/<UUID>.json"
+        fi
+
+        log "info" "Config tunnel mode: config=${cfg}${tid:+ tunnel=${tid}}${creds:+ credentials=${creds}}"
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Optional: origin certificate for managing tunnels (cert.pem).
+# Required only for `cloudflared tunnel create/route/delete` operations,
+# NOT for `cloudflared tunnel run`. We materialise it if provided so users
+# can run cf-tunnel as their cloudflared workstation when desired.
+# ---------------------------------------------------------------------------
+oc="$(_strip "${TUNNEL_ORIGIN_CERT:-}")"
+oc_contents="$(_resolve_file_secret TUNNEL_ORIGIN_CERT)"
+if [[ -n "${oc_contents}" && "${oc_contents}" != "${oc}" ]]; then
+    target="${oc:-${CONFIG_DIR}/cert.pem}"
+    mkdir -p "$(dirname "${target}")"
+    umask 077
+    printf '%s' "${oc_contents}" > "${target}"
+    chmod 0600 "${target}"
+    chown abc:abc "${target}" 2>/dev/null || true
+    log "info" "Materialised origin certificate to ${target}"
+    oc="${target}"
+fi
+if [[ -n "${oc}" && -f "${oc}" ]]; then
+    echo "${oc}" > "${STATE_DIR}/origin-cert"
+    log "info" "Origin certificate available at ${oc}"
+fi
+
+# ---------------------------------------------------------------------------
+# Sentinel for the healthcheck. The svc-cf-tunnel-logs heartbeat refreshes
+# this mtime every successful /ready probe; the healthcheck rejects stale
+# files. We `touch` it now so the first 60s start_period doesn't fail.
+# ---------------------------------------------------------------------------
+: > "${STATE_DIR}/online"
+chmod 0644 "${STATE_DIR}/online"
+chown abc:abc "${STATE_DIR}/online" 2>/dev/null || true
+
+# Banner -- mirrors LSIO format but ASCII-only.
+INSTALLED_VERSION="$(/usr/local/bin/cloudflared --version 2>/dev/null | head -n1 || echo 'cloudflared (version unknown)')"
+log "info" "==========================================================="
+log "info" "  docker-cf-tunnel ready"
+log "info" "  cloudflared:  ${INSTALLED_VERSION}"
+log "info" "  mode:         ${TUNNEL_MODE}"
+log "info" "  metrics:      http://${TUNNEL_METRICS:-0.0.0.0:2000}/ (incl. /ready, /metrics)"
+log "info" "==========================================================="

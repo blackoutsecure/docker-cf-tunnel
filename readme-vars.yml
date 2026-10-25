@@ -1,0 +1,162 @@
+---
+# project information
+project_name: cf-tunnel
+project_url: "https://github.com/cloudflare/cloudflared"
+project_logo: ""
+project_blurb: "[Cloudflare Tunnel]({{ project_url }}) (cloudflared) is the connector daemon that exposes services running behind NAT/firewall to Cloudflare's network without opening inbound ports. This image is an unofficial community container built in a LinuxServer.io-style pattern, with hardened runtime defaults, s6 process supervision, and support for all three tunnel modes: zero-auth Quick Tunnels (trycloudflare.com), token-based named tunnels, and locally-managed config-file tunnels. Supports Balena deployment for IoT/edge devices. Sponsored and maintained by Blackout Secure (https://blackoutsecure.app)."
+project_lsio_github_repo_url: "https://github.com/blackoutsecure/docker-cf-tunnel"
+project_categories: "Networking,Security,IoT"
+
+# supported architectures
+available_architectures:
+  - {arch: "{{ arch_x86_64 }}", tag: "amd64-latest"}
+  - {arch: "{{ arch_arm64 }}", tag: "arm64v8-latest"}
+
+# common parameters
+common_param_env_vars_enabled: true
+param_container_name: "{{ project_name }}"
+param_usage_include_vols: true
+param_volumes:
+  - {vol_path: "/config", vol_host_path: "/path/to/cf-tunnel/config", desc: "Tunnel configuration directory (config.yml, credentials JSON, cert.pem). Optional for quick/token modes."}
+
+param_usage_include_net: false
+param_usage_include_env: true
+param_env_vars:
+  - {env_var: "TZ", env_value: "Etc/UTC", desc: "Timezone (see TZ database)"}
+  - {env_var: "TUNNEL_MODE", env_value: "quick", desc: "Tunnel mode: quick | token | config (auto-detected if unset, see README)"}
+
+# optional env variables
+opt_param_usage_include_env: true
+opt_param_env_vars:
+  # Quick mode
+  - {env_var: "TUNNEL_URL", env_value: "http://app:8080", desc: "[quick mode] URL of the upstream service to expose via *.trycloudflare.com"}
+
+  # Token mode
+  - {env_var: "TUNNEL_TOKEN", env_value: "", desc: "[token mode] Tunnel token from Cloudflare Zero Trust dashboard"}
+  - {env_var: "TUNNEL_TOKEN_FILE", env_value: "", desc: "[token mode] Path to file containing the token (Docker secrets / Kubernetes projected volumes)"}
+
+  # Config mode
+  - {env_var: "TUNNEL_CONFIG_FILE", env_value: "/config/config.yml", desc: "[config mode] Path to cloudflared config.yml (auto-detected from /config/config.yml or /config/config.yaml if unset)"}
+  - {env_var: "TUNNEL_NAME", env_value: "", desc: "[config mode] Tunnel name (overrides 'tunnel:' key in config.yml)"}
+  - {env_var: "TUNNEL_ID", env_value: "", desc: "[config mode] Tunnel UUID (overrides 'tunnel:' key in config.yml)"}
+  - {env_var: "TUNNEL_CREDENTIALS_FILE", env_value: "", desc: "[config mode] Path to credentials JSON file (overrides 'credentials-file:' in config.yml)"}
+  - {env_var: "TUNNEL_CREDENTIALS_CONTENTS", env_value: "", desc: "[config mode] Inline credentials JSON content (writes to TUNNEL_CREDENTIALS_FILE or /config/<id>.json)"}
+  - {env_var: "TUNNEL_CREDENTIALS_CONTENTS_FILE", env_value: "", desc: "[config mode] Path to file containing credentials JSON (Docker secrets)"}
+  - {env_var: "TUNNEL_ORIGIN_CERT", env_value: "", desc: "Path to cert.pem (only required for `cloudflared tunnel create/route/delete` operations, not for run)"}
+  - {env_var: "TUNNEL_ORIGIN_CERT_FILE", env_value: "", desc: "Path to file containing cert.pem contents (Docker secrets)"}
+
+  # Cloudflared runtime tunables
+  - {env_var: "TUNNEL_LOGLEVEL", env_value: "info", desc: "cloudflared log level: debug | info | warn | error | fatal"}
+  - {env_var: "TUNNEL_TRANSPORT_LOGLEVEL", env_value: "", desc: "cloudflared transport log level (passed as --transport-loglevel)"}
+  - {env_var: "TUNNEL_METRICS", env_value: "0.0.0.0:2000", desc: "Metrics bind address; exposes /ready (healthcheck) and /metrics (Prometheus)"}
+  - {env_var: "TUNNEL_PROTOCOL", env_value: "auto", desc: "Edge transport: auto | http2 | quic"}
+  - {env_var: "TUNNEL_EDGE_IP_VERSION", env_value: "auto", desc: "Edge IP family: auto | 4 | 6"}
+  - {env_var: "TUNNEL_REGION", env_value: "", desc: "Restrict tunnel to a Cloudflare region (e.g. us)"}
+  - {env_var: "TUNNEL_RETRIES", env_value: "", desc: "Max retries before declaring a tunnel down"}
+  - {env_var: "TUNNEL_GRACE_PERIOD", env_value: "30s", desc: "Time cloudflared waits for in-flight requests on shutdown"}
+  - {env_var: "TUNNEL_HA_CONNECTIONS", env_value: "", desc: "Number of high-availability edge connections (cloudflared default 4)"}
+  - {env_var: "TUNNEL_POST_QUANTUM", env_value: "", desc: "Set to 'true' to enable post-quantum (Kyber768) key exchange"}
+  - {env_var: "EXTRA_CLOUDFLARED_ARGS", env_value: "", desc: "Additional CLI args appended to the cloudflared invocation (power-user escape hatch; use single-string quoted list)"}
+  - {env_var: "NO_AUTOUPDATE", env_value: "true", desc: "Disable cloudflared's self-update (always recommended; we manage versions via image tags)"}
+  - {env_var: "LOG_LEVEL", env_value: "info", desc: "Container init script log verbosity (separate from TUNNEL_LOGLEVEL)"}
+
+  # Customization hooks
+  - {env_var: "EXTRA_PACKAGES", env_value: "", desc: "Space-separated apt packages installed at startup as root (escape hatch; for repeated use build a custom image; incompatible with read_only: true)"}
+  - {env_var: "EXTRA_APT_REPOS", env_value: "", desc: "Semicolon-separated apt sources lines added before installing EXTRA_PACKAGES"}
+  - {env_var: "EXTRA_INIT_SCRIPT", env_value: "", desc: "Path inside container to a shell script (typically bind-mounted) run as root before cloudflared starts"}
+
+  # Health & heartbeat
+  - {env_var: "HEARTBEAT_INTERVAL", env_value: "120", desc: "Seconds between health-heartbeat banners (clamped to >=30)"}
+  - {env_var: "HEALTH_STALE_AFTER", env_value: "120", desc: "Seconds before the Docker HEALTHCHECK reports unhealthy if the online sentinel goes stale"}
+  - {env_var: "HEALTH_REQUIRE_CONNECTIONS", env_value: "1", desc: "Minimum ready edge connections required for the HEALTHCHECK to pass"}
+  - {env_var: "QUICK_URL_PERSIST_FILE", env_value: "/config/quick-url.txt", desc: "Where the quick-tunnel URL is persisted for scripted access"}
+
+  # s6 / shutdown
+  - {env_var: "S6_SERVICES_GRACETIME", env_value: "30000", desc: "s6 service shutdown gracetime (ms) -- must allow time for cloudflared to drain connections (TUNNEL_GRACE_PERIOD)"}
+  - {env_var: "S6_KILL_GRACETIME", env_value: "30000", desc: "s6 hard-kill gracetime (ms) -- keep aligned with stop_grace_period in compose"}
+  - {env_var: "PUID", env_value: "1000", desc: "User ID for /config ownership (LinuxServer.io base image standard)"}
+  - {env_var: "PGID", env_value: "1000", desc: "Group ID for /config ownership (LinuxServer.io base image standard)"}
+
+# optional parameters
+optional_parameters: |
+  For Cloudflare Zero Trust dashboard-managed tunnels (recommended for production):
+
+  ```
+    -e TUNNEL_MODE=token
+    -e TUNNEL_TOKEN=eyJhIjoiNzQyMzAyMjE...
+  ```
+
+# application setup block
+app_setup_block_enabled: true
+app_setup_block: |
+  This image runs the upstream `cloudflared` daemon under s6 process supervision
+  with three operating modes:
+
+  **Quick Tunnels (quick mode)** -- the simplest way to expose a local service
+  to the internet. Cloudflare assigns an ephemeral `*.trycloudflare.com` URL on
+  every restart. No Cloudflare account or DNS configuration required.
+
+  ```
+    -e TUNNEL_MODE=quick -e TUNNEL_URL=http://app:8080
+  ```
+
+  The assigned URL appears in the container logs as a prominent banner and is
+  also persisted to `/config/quick-url.txt` for scripted access.
+
+  **Named Tunnels via Token (token mode)** -- the recommended production mode
+  when you manage your tunnel from the Cloudflare Zero Trust dashboard. Generate
+  a tunnel and copy the token shown after `cloudflared service install`.
+
+  ```
+    -e TUNNEL_MODE=token -e TUNNEL_TOKEN=eyJhIjoiNzQyMzAyMjE...
+  ```
+
+  Public hostnames, ingress rules, access policies, and warp routing are all
+  managed in the dashboard. Container restarts are stateless.
+
+  **Named Tunnels via Config (config mode)** -- the legacy / GitOps mode where
+  the tunnel definition lives on disk in `config.yml`. Run
+  `cloudflared tunnel login` (writes `cert.pem`), then
+  `cloudflared tunnel create <name>` (writes `<UUID>.json`), then mount the
+  resulting `~/.cloudflared` directory at `/config`.
+
+  ```
+    -v /path/to/cloudflared:/config:ro -e TUNNEL_MODE=config -e TUNNEL_NAME=my-prod-tunnel
+  ```
+
+  **Health Monitoring**: The image includes a Docker HEALTHCHECK that combines
+  process liveness with cloudflared's `/ready` endpoint and an "online" sentinel
+  refreshed by the heartbeat service. See the README for the full failure-mode
+  matrix.
+
+  **Balena Deployment**: This image supports deployment to Balena-powered IoT
+  and edge devices using `balena push <your-app-slug>`. See the `balena.yml`
+  file and [Balena documentation](https://docs.balena.io/) for details.
+
+# hardware acceleration
+readme_hwaccel: false
+
+# read-only support
+readonly_supported: true
+readonly_message: |
+  Read-only operation is fully supported. Required tmpfs mounts:
+
+  - `/run:exec` -- required by s6-overlay
+  - `/tmp:exec`
+  - `/var/log`
+
+  cloudflared keeps no on-disk state in token or quick modes. For config mode,
+  mount `/config` read-only with `config.yml` and the credentials JSON pre-baked.
+
+# non-root support
+nonroot_supported: true
+nonroot_message: |
+  Two modes are supported:
+    1. Default (recommended): container starts as root, then cloudflared is
+       dropped to the LSIO `abc` user (uid 911) via s6-setuidgid. PUID/PGID,
+       Docker Mods, and EXTRA_PACKAGES all work normally.
+    2. LSIO non-root opt-in (https://docs.linuxserver.io/misc/non-root/): set
+       `user: "911:911"` (or any uid:gid) on the service. The container's PID 1
+       runs unprivileged. Caveats: PUID/PGID and EXTRA_PACKAGES are ignored;
+       /run tmpfs MUST be owned by the chosen uid. See the README for a full
+       compose example.

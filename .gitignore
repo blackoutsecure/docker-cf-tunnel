@@ -1,0 +1,54 @@
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+.secrets/
+
+# Cloudflare Tunnel runtime artifacts.
+# These are runtime-only files (cert.pem is the origin certificate that
+# authenticates a Cloudflare account to the tunnel API; <UUID>.json contains
+# the tunnel's secret credentials). They must NEVER be committed.
+cert.pem
+*.tunnel.json
+*-credentials.json
+tunnel-secrets/
+*_token.txt
+*.cf-token
+
+# Common private key / cert formats
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ecdsa
+id_ed25519
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+.*.swp
+*~
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.so
+*.log
+.tmp-config/
+tmp/
+
+# Runtime and local development
+/local/
+/.local/
+.cache/
+*.tmp
+
+# Version and patch files
+.version
+*.orig
+*.rej
+*.patch

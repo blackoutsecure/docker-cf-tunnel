@@ -1,0 +1,119 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# svc-cf-tunnel/run -- the supervised cloudflared longrun.
+#
+# Reads the validated state written by init-cf-tunnel-config and exec's
+# cloudflared as the abc (uid 911) user with the appropriate argv for
+# the configured mode. cloudflared then becomes the supervised PID;
+# s6-svscan watches it and restarts on exit per s6 longrun semantics.
+#
+# Logs go to /proc/1/fd/{1,2} so docker logs / balena log ingest see
+# them via PID 1's stdio instead of via s6's catch-all logger.
+#
+set -uo pipefail
+
+STATE_DIR="/run/cf-tunnel"
+CFD="/usr/local/bin/cloudflared"
+
+if [[ ! -x "${CFD}" ]]; then
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel[fatal]: ${CFD} is missing or not executable" >&2
+    exit 1
+fi
+if [[ ! -f "${STATE_DIR}/mode" ]]; then
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel[fatal]: ${STATE_DIR}/mode not found -- init-cf-tunnel-config did not run" >&2
+    exit 1
+fi
+
+MODE="$(cat "${STATE_DIR}/mode")"
+
+# Common argv -- applies to all three modes.
+declare -a CMD=("${CFD}")
+
+# Config-mode passes its --config FLAG before the `tunnel` subcommand.
+if [[ "${MODE}" == "config" ]] && [[ -f "${STATE_DIR}/config-file" ]]; then
+    CMD+=( "--config" "$(cat "${STATE_DIR}/config-file")" )
+fi
+
+# Cloudflared also accepts --origincert globally; honour it if user opted in.
+if [[ -f "${STATE_DIR}/origin-cert" ]]; then
+    CMD+=( "--origincert" "$(cat "${STATE_DIR}/origin-cert")" )
+fi
+
+CMD+=( "tunnel" )
+CMD+=( "--no-autoupdate" )
+CMD+=( "--metrics" "${TUNNEL_METRICS:-0.0.0.0:2000}" )
+CMD+=( "--loglevel" "${TUNNEL_LOGLEVEL:-info}" )
+
+[[ -n "${TUNNEL_TRANSPORT_LOGLEVEL:-}" ]] && CMD+=( "--transport-loglevel" "${TUNNEL_TRANSPORT_LOGLEVEL}" )
+[[ -n "${TUNNEL_PROTOCOL:-}" ]]           && CMD+=( "--protocol" "${TUNNEL_PROTOCOL}" )
+[[ -n "${TUNNEL_EDGE_IP_VERSION:-}" ]]    && CMD+=( "--edge-ip-version" "${TUNNEL_EDGE_IP_VERSION}" )
+[[ -n "${TUNNEL_REGION:-}" ]]             && CMD+=( "--region" "${TUNNEL_REGION}" )
+[[ -n "${TUNNEL_RETRIES:-}" ]]            && CMD+=( "--retries" "${TUNNEL_RETRIES}" )
+[[ -n "${TUNNEL_GRACE_PERIOD:-}" ]]       && CMD+=( "--grace-period" "${TUNNEL_GRACE_PERIOD}" )
+[[ -n "${TUNNEL_HA_CONNECTIONS:-}" ]]     && CMD+=( "--ha-connections" "${TUNNEL_HA_CONNECTIONS}" )
+[[ -n "${TUNNEL_HEARTBEAT_INTERVAL:-}" ]] && CMD+=( "--heartbeat-interval" "${TUNNEL_HEARTBEAT_INTERVAL}" )
+[[ -n "${TUNNEL_HEARTBEAT_COUNT:-}" ]]    && CMD+=( "--heartbeat-count" "${TUNNEL_HEARTBEAT_COUNT}" )
+[[ "${TUNNEL_POST_QUANTUM:-}" == "true" ]] && CMD+=( "--post-quantum" )
+
+# Mode-specific argv.
+case "${MODE}" in
+    quick)
+        CMD+=( "--url" "$(cat "${STATE_DIR}/url")" )
+        ;;
+    token)
+        CMD+=( "run" "--token" "$(cat "${STATE_DIR}/token")" )
+        ;;
+    config)
+        CMD+=( "run" )
+        if [[ -f "${STATE_DIR}/credentials" ]]; then
+            CMD+=( "--credentials-file" "$(cat "${STATE_DIR}/credentials")" )
+        fi
+        if [[ -f "${STATE_DIR}/tunnel-id" ]]; then
+            CMD+=( "$(cat "${STATE_DIR}/tunnel-id")" )
+        fi
+        ;;
+    *)
+        echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel[fatal]: unknown mode '${MODE}'" >&2
+        exit 1
+        ;;
+esac
+
+# Append user-controlled extra arguments LAST so they can override.
+# We use bash word-splitting on EXTRA_CLOUDFLARED_ARGS deliberately --
+# this is a power-user knob and quoting is the user's responsibility.
+if [[ -n "${EXTRA_CLOUDFLARED_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA_ARGS=( ${EXTRA_CLOUDFLARED_ARGS} )
+    CMD+=( "${EXTRA_ARGS[@]}" )
+fi
+
+# Pretty-log the redacted argv so users can see what cloudflared is invoked with.
+declare -a SAFE_ARGV=()
+_skip_next=0
+for arg in "${CMD[@]}"; do
+    if (( _skip_next )); then
+        SAFE_ARGV+=( "<redacted>" )
+        _skip_next=0
+        continue
+    fi
+    case "${arg}" in
+        --token|--credentials-file)
+            SAFE_ARGV+=( "${arg}" )
+            _skip_next=1
+            ;;
+        *)
+            SAFE_ARGV+=( "${arg}" )
+            ;;
+    esac
+done
+
+echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel[info]: starting cloudflared (mode=${MODE})"
+echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel[info]:   argv: ${SAFE_ARGV[*]}"
+
+# Pin stdio to PID 1 so docker/balena/k8s log collectors see us.
+exec >/proc/1/fd/1 2>/proc/1/fd/2
+
+# Drop privileges to the LSIO non-root user. cloudflared then becomes the
+# direct child of s6-svscan, so signals propagate cleanly.
+exec s6-setuidgid abc "${CMD[@]}"

@@ -1,0 +1,57 @@
+name: cf-tunnel
+description: >-
+  Containerized Cloudflare Tunnel (cloudflared) connector with s6 process
+  supervision and non-root defaults. Supports zero-auth Quick Tunnels
+  (trycloudflare.com), token-based named tunnels managed via the Cloudflare
+  Zero Trust dashboard, and locally-managed config-file tunnels. Built for
+  IoT and edge devices.
+post-provisioning: >-
+  ## Usage instructions
+
+  Include this snippet in your docker-compose.yml file under 'services':
+
+    ```
+    cf-tunnel:
+      image: blackoutsecure/cf-tunnel:latest
+      restart: unless-stopped
+      environment:
+        - TZ=Etc/UTC
+        - TUNNEL_MODE=token
+        - TUNNEL_TOKEN=YOUR_TUNNEL_TOKEN
+      volumes:
+        - cf-tunnel-config:/config
+      security_opt:
+        - 'no-new-privileges:true'
+    ```
+
+  Three operating modes:
+
+  - **quick**  -- ephemeral *.trycloudflare.com URL, no auth required.
+                  Set TUNNEL_MODE=quick and TUNNEL_URL=http://your-service:port.
+  - **token**  -- named tunnel managed via the Cloudflare Zero Trust dashboard.
+                  Set TUNNEL_MODE=token and TUNNEL_TOKEN=<dashboard-token>.
+  - **config** -- locally-managed named tunnel via config.yml.
+                  Set TUNNEL_MODE=config, mount /config with config.yml +
+                  credentials JSON + (optional) cert.pem.
+
+  Repository: https://github.com/blackoutsecure/docker-cf-tunnel
+  Upstream application: https://github.com/cloudflare/cloudflared
+
+version: 2026.10.3
+type: sw.block
+assets:
+  repository:
+    type: blob.asset
+    data:
+      url: 'https://github.com/blackoutsecure/docker-cf-tunnel'
+data:
+  defaultDeviceType: raspberrypi3-64
+  supportedDeviceTypes:
+    - raspberrypi3
+    - raspberrypi3-64
+    - raspberrypi4
+    - raspberrypi4-64
+    - raspberrypi400
+    - raspberrypi400-64
+    - intel-nuc
+    - genericx86-64-ext

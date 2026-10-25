@@ -1,0 +1,238 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# svc-cf-tunnel-logs -- periodic health heartbeat + quick-tunnel URL hoister.
+#
+# This service does NOT collect cloudflared's stdout/stderr (those are
+# already piped to PID 1 by svc-cf-tunnel/run). Instead it polls
+# cloudflared's /ready and /metrics HTTP endpoints and:
+#
+#   1. Refreshes /run/cf-tunnel/online sentinel so the container HEALTHCHECK
+#      passes whenever there's at least one healthy edge connection.
+#   2. Emits a short, easy-to-grep heartbeat banner every HEARTBEAT_INTERVAL
+#      seconds with mode, uptime, edge connection count, and last-known
+#      upstream-bytes counter.
+#   3. For TUNNEL_MODE=quick, scrapes the cloudflared log stream out of the
+#      PID-1 stdio for the *.trycloudflare.com URL and re-broadcasts it in a
+#      prominent banner (because dashboard log panes truncate that line).
+#      The URL is also persisted to ${QUICK_URL_PERSIST_FILE}
+#      (default /config/quick-url.txt) for scripted access.
+#
+set -uo pipefail
+
+STATE_DIR="/run/cf-tunnel"
+INTERVAL="${HEARTBEAT_INTERVAL:-120}"
+METRICS_ENDPOINT="${TUNNEL_METRICS:-0.0.0.0:2000}"
+# Strip 0.0.0.0:/[::]: -> probe via loopback always.
+METRICS_PORT="${METRICS_ENDPOINT##*:}"
+READY_URL="http://127.0.0.1:${METRICS_PORT}/ready"
+METRICS_URL="http://127.0.0.1:${METRICS_PORT}/metrics"
+PERSIST_FILE="${QUICK_URL_PERSIST_FILE:-/config/quick-url.txt}"
+
+# Bracket the interval to a sensible range. Many monitoring setups try a
+# value of 0 to disable; we fold that to "infinity" via a long sleep.
+if ! [[ "${INTERVAL}" =~ ^[0-9]+$ ]]; then
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel-logs[warn]: HEARTBEAT_INTERVAL='${INTERVAL}' is not a positive integer; defaulting to 120"
+    INTERVAL=120
+fi
+if (( INTERVAL > 0 && INTERVAL < 30 )); then
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel-logs[warn]: HEARTBEAT_INTERVAL=${INTERVAL} is too aggressive; clamping to 30s"
+    INTERVAL=30
+fi
+
+# Pin stdio to PID 1 so banners reach docker logs.
+exec >/proc/1/fd/1 2>/proc/1/fd/2
+
+if [[ ! -f "${STATE_DIR}/mode" ]]; then
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel-logs[fatal]: ${STATE_DIR}/mode not found"
+    exit 1
+fi
+MODE="$(cat "${STATE_DIR}/mode")"
+
+START_TS="$(date +%s)"
+QUICK_URL=""
+QUICK_URL_LOGGED=0
+
+_now()  { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
+_log()  { echo "$(_now) svc-cf-tunnel-logs[$1]: $2"; }
+_uptime() {
+    local now elapsed h m s
+    now="$(date +%s)"
+    elapsed=$(( now - START_TS ))
+    h=$(( elapsed / 3600 ))
+    m=$(( (elapsed % 3600) / 60 ))
+    s=$(( elapsed % 60 ))
+    printf '%dh%02dm%02ds' "${h}" "${m}" "${s}"
+}
+
+# Drop privileges -- we don't need root for HTTP probes or grep.
+# (Note: s6-setuidgid is not used here because we want to read /proc/1/fd/1
+# which requires root or CAP_SYS_PTRACE on most kernels. Stay as root.)
+
+_probe_ready() {
+    # Returns 0 + writes connection count to stdout when ready, else 1.
+    local body code conn
+    body="$(curl -fsSL --max-time 5 -w '\n%{http_code}' "${READY_URL}" 2>/dev/null || true)"
+    code="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+    if [[ "${code}" != "200" ]]; then
+        return 1
+    fi
+    conn="$(echo "${body}" | jq -r '.ConnectorID // empty | length // 0' 2>/dev/null)"
+    # /ready actually returns {status, readyConnections, connectorId, ...}
+    conn="$(echo "${body}" | jq -r '.readyConnections // .ready_connections // 0' 2>/dev/null)"
+    echo "${conn:-0}"
+    return 0
+}
+
+_probe_metrics() {
+    # Returns metrics body on stdout (Prometheus text format) or empty on failure.
+    curl -fsSL --max-time 5 "${METRICS_URL}" 2>/dev/null || true
+}
+
+_metric_value() {
+    # _metric_value <body> <metric_name>
+    # Sums all label-instances of <metric_name> -- enough for our heartbeat.
+    local body="$1" name="$2"
+    echo "${body}" | awk -v m="${name}" '
+        /^[[:space:]]*#/ { next }
+        $1 ~ ("^"m"(\\{|$)") {
+            # last numeric token is the value
+            val = $NF + 0
+            sum += val
+        }
+        END { printf("%.0f", sum) }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Quick-URL extractor (TUNNEL_MODE=quick only).
+# Cloudflared logs a banner like:
+#     2026-05-13T11:56:41Z INF +-----------------------------------+
+#     2026-05-13T11:56:41Z INF |  https://random-words-1234.trycloudflare.com  |
+#     2026-05-13T11:56:41Z INF +-----------------------------------+
+# Some versions use a JSON log line with msg containing the URL. We grep
+# for the *.trycloudflare.com pattern in any container log captured by PID 1
+# and broadcast it.
+# ---------------------------------------------------------------------------
+
+_emit_quick_url_banner() {
+    local url="$1"
+    cat <<EOF
+========================================================================
+  CLOUDFLARE QUICK TUNNEL URL
+  ------------------------------------------------------------------
+  ${url}
+  ------------------------------------------------------------------
+  Persisted to: ${PERSIST_FILE}
+  This URL is EPHEMERAL and changes every container restart.
+  For a stable hostname, use TUNNEL_MODE=token or TUNNEL_MODE=config.
+========================================================================
+EOF
+}
+
+_persist_quick_url() {
+    local url="$1"
+    if ( : > "$(dirname "${PERSIST_FILE}")/.rw-probe.$$" ) 2>/dev/null; then
+        rm -f "$(dirname "${PERSIST_FILE}")/.rw-probe.$$"
+        if printf '%s\n' "${url}" > "${PERSIST_FILE}" 2>/dev/null; then
+            chown abc:abc "${PERSIST_FILE}" 2>/dev/null || true
+        fi
+    fi
+}
+
+# For quick mode: spawn an asynchronous tail of cloudflared's metrics
+# /quicktunnel endpoint to pick up the URL once cloudflared has started.
+# Newer cloudflared exposes quicktunnel info under /metrics (a label of
+# `cloudflared_quicktunnel_url{url="..."}`) -- fall back to log scraping
+# is impossible from within s6 so we ALSO read PID 1's combined log file.
+
+_extract_quick_url_from_metrics() {
+    local body url
+    body="$(_probe_metrics)"
+    [[ -z "${body}" ]] && return 1
+    # Try the dedicated quicktunnel gauge first.
+    url="$(echo "${body}" | grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' | head -n1 || true)"
+    if [[ -n "${url}" ]]; then
+        echo "${url}"
+        return 0
+    fi
+    return 1
+}
+
+_extract_quick_url_from_logs() {
+    # Read recent container stderr from PID 1. /proc/1/fd/2 is a write end;
+    # we cannot read it directly. Instead, scan /var/log/messages-style
+    # files if present, falling back to /tmp/.s6-overlay-cloudflared.log
+    # (we do NOT depend on this; the metrics path above is the primary).
+    local logf url
+    for logf in /var/log/messages /var/log/syslog /tmp/.cf-tunnel-stderr; do
+        [[ -f "${logf}" ]] || continue
+        url="$(grep -oE 'https://[a-z0-9.-]+\.trycloudflare\.com' "${logf}" 2>/dev/null | tail -n1)"
+        if [[ -n "${url}" ]]; then
+            echo "${url}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Initial wait so cloudflared has time to bind /metrics. We sleep up to 60s
+# poking /ready every 2s, but always emit the first heartbeat after that.
+# ---------------------------------------------------------------------------
+_log info "heartbeat service started (mode=${MODE} interval=${INTERVAL}s metrics=${READY_URL})"
+WAITED=0
+while (( WAITED < 60 )); do
+    if curl -fsS --max-time 2 -o /dev/null "${READY_URL}" 2>/dev/null; then
+        _log info "cloudflared metrics endpoint became available after ${WAITED}s"
+        break
+    fi
+    sleep 2
+    WAITED=$(( WAITED + 2 ))
+done
+
+# ---------------------------------------------------------------------------
+# Main loop.
+# ---------------------------------------------------------------------------
+FAIL_STREAK=0
+while :; do
+    if conns="$(_probe_ready)"; then
+        # Healthy: refresh sentinel.
+        : > "${STATE_DIR}/online"
+        chown abc:abc "${STATE_DIR}/online" 2>/dev/null || true
+
+        FAIL_STREAK=0
+        body="$(_probe_metrics)"
+        upstream_bytes="$(_metric_value "${body}" 'cloudflared_tunnel_total_requests' 2>/dev/null || echo 0)"
+        active_streams="$(_metric_value "${body}" 'cloudflared_tunnel_active_streams' 2>/dev/null || echo 0)"
+        ha_conns="$(_metric_value "${body}" 'cloudflared_tunnel_ha_connections' 2>/dev/null || echo 0)"
+
+        echo "$(_now) *** HEALTH HEARTBEAT *** mode=${MODE} ready_connections=${conns} ha_connections=${ha_conns} active_streams=${active_streams} total_requests=${upstream_bytes} uptime=$(_uptime)"
+
+        # Quick-mode URL extraction (only until we've found and announced it).
+        if [[ "${MODE}" == "quick" && "${QUICK_URL_LOGGED}" == "0" ]]; then
+            url="$(_extract_quick_url_from_metrics 2>/dev/null || _extract_quick_url_from_logs 2>/dev/null || true)"
+            if [[ -n "${url}" ]]; then
+                QUICK_URL="${url}"
+                QUICK_URL_LOGGED=1
+                _emit_quick_url_banner "${QUICK_URL}"
+                _persist_quick_url "${QUICK_URL}"
+            else
+                _log info "quick-tunnel URL not yet visible in /metrics; will retry next heartbeat"
+            fi
+        fi
+    else
+        FAIL_STREAK=$(( FAIL_STREAK + 1 ))
+        _log warn "/ready probe failed (attempt #${FAIL_STREAK}); cloudflared may be reconnecting (mode=${MODE} uptime=$(_uptime))"
+        # We deliberately do NOT clear /run/cf-tunnel/online here -- the
+        # healthcheck script handles staleness via mtime comparison.
+    fi
+
+    if (( INTERVAL == 0 )); then
+        # Disabled -- still keep the service alive so s6 doesn't restart-loop us.
+        sleep 86400
+    else
+        sleep "${INTERVAL}"
+    fi
+done

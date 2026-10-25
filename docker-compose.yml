@@ -1,0 +1,83 @@
+version: '2.4'
+
+# ---------------------------------------------------------------------------
+# Example docker-compose for blackoutsecure/cf-tunnel.
+# This file shows the QUICK-tunnel mode (zero auth, ephemeral
+# *.trycloudflare.com URL). See the README for token & config modes.
+# ---------------------------------------------------------------------------
+services:
+  cf-tunnel:
+    image: docker.io/blackoutsecure/cf-tunnel:latest
+    container_name: cf-tunnel
+    environment:
+      TZ: Etc/UTC
+      # Quick mode -- no Cloudflare account required.
+      TUNNEL_MODE: "quick"
+      TUNNEL_URL: "http://app:8080"
+      # Common knobs (uncomment as needed):
+      # TUNNEL_LOGLEVEL: "info"
+      # TUNNEL_PROTOCOL: "auto"           # auto | http2 | quic
+      # TUNNEL_METRICS: "0.0.0.0:2000"    # /ready and /metrics endpoints
+      # HEARTBEAT_INTERVAL: "120"
+    labels:
+      io.balena.features.supervisor-api: '1'
+      io.balena.features.balena-api: '1'
+    security_opt:
+      - no-new-privileges=true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
+    tmpfs:
+      - /run:exec,size=16m
+      - /tmp:exec,size=16m
+      - /var/log:size=16m
+    volumes:
+      - cf-tunnel-config:/config
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+# ---------------------------------------------------------------------------
+# Token-mode example (named tunnel managed via Cloudflare Zero Trust):
+#
+# services:
+#   cf-tunnel:
+#     image: docker.io/blackoutsecure/cf-tunnel:latest
+#     environment:
+#       TZ: Etc/UTC
+#       TUNNEL_MODE: "token"
+#     secrets:
+#       - source: cf_tunnel_token
+#         target: /run/secrets/tunnel-token
+#     environment:
+#       TUNNEL_TOKEN_FILE: "/run/secrets/tunnel-token"
+#     restart: unless-stopped
+#
+# secrets:
+#   cf_tunnel_token:
+#     file: ./tunnel-token.txt
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Config-mode example (locally-managed named tunnel):
+#
+# services:
+#   cf-tunnel:
+#     image: docker.io/blackoutsecure/cf-tunnel:latest
+#     environment:
+#       TZ: Etc/UTC
+#       TUNNEL_MODE: "config"
+#       TUNNEL_NAME: "my-prod-tunnel"
+#       # TUNNEL_CONFIG_FILE defaults to /config/config.yml
+#       # TUNNEL_CREDENTIALS_FILE defaults to value of credentials-file: in config.yml
+#     volumes:
+#       - ./cloudflared:/config:ro    # contains config.yml + <UUID>.json + cert.pem
+#     restart: unless-stopped
+# ---------------------------------------------------------------------------
+
+volumes:
+  cf-tunnel-config:

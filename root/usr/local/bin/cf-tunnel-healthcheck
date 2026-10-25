@@ -1,0 +1,68 @@
+#!/bin/bash
+# shellcheck shell=bash
+#
+# cf-tunnel-healthcheck
+# ---------------------
+# Container HEALTHCHECK script. Returns 0 (healthy) iff ALL of:
+#
+#   1. The cloudflared process is alive (pgrep cloudflared)
+#   2. cloudflared's /ready endpoint returns HTTP 200 with at least
+#      ${HEALTH_REQUIRE_CONNECTIONS} (default 1) ready edge connections
+#   3. The /run/cf-tunnel/online sentinel is fresh (mtime within
+#      ${HEALTH_STALE_AFTER}s of now)
+#
+# Exit 1 (unhealthy) on any failure. The container HEALTHCHECK then
+# trips after `retries` consecutive failures.
+#
+set -euo pipefail
+
+STATE_DIR="/run/cf-tunnel"
+SENTINEL="${STATE_DIR}/online"
+STALE_AFTER="${HEALTH_STALE_AFTER:-120}"
+REQUIRE_CONNS="${HEALTH_REQUIRE_CONNECTIONS:-1}"
+
+# Probe URL: derive from TUNNEL_METRICS bind address (e.g. 0.0.0.0:2000 -> :2000).
+METRICS_ENDPOINT="${TUNNEL_METRICS:-0.0.0.0:2000}"
+METRICS_PORT="${METRICS_ENDPOINT##*:}"
+READY_URL="http://127.0.0.1:${METRICS_PORT}/ready"
+
+_fail() {
+    echo "UNHEALTHY: $*" >&2
+    exit 1
+}
+
+# 1. cloudflared process alive?
+if ! pgrep -x cloudflared >/dev/null 2>&1; then
+    _fail "cloudflared process is not running"
+fi
+
+# 2. /ready returns 200 + readyConnections >= REQUIRE_CONNS.
+HTTP_RESP="$(curl -fsS --max-time 5 -w '\n%{http_code}' "${READY_URL}" 2>/dev/null || true)"
+HTTP_CODE="${HTTP_RESP##*$'\n'}"
+HTTP_BODY="${HTTP_RESP%$'\n'*}"
+
+if [[ "${HTTP_CODE}" != "200" ]]; then
+    _fail "/ready returned HTTP ${HTTP_CODE:-<no-response>}"
+fi
+
+CONNS="$(echo "${HTTP_BODY}" | jq -r '.readyConnections // .ready_connections // 0' 2>/dev/null || echo 0)"
+if ! [[ "${CONNS}" =~ ^[0-9]+$ ]]; then
+    CONNS=0
+fi
+if (( CONNS < REQUIRE_CONNS )); then
+    _fail "/ready reports only ${CONNS} ready connections (need ${REQUIRE_CONNS})"
+fi
+
+# 3. Sentinel freshness.
+if [[ ! -f "${SENTINEL}" ]]; then
+    _fail "online sentinel ${SENTINEL} is missing -- heartbeat service may have died"
+fi
+NOW="$(date +%s)"
+SENTINEL_MTIME="$(stat -c '%Y' "${SENTINEL}" 2>/dev/null || echo 0)"
+AGE=$(( NOW - SENTINEL_MTIME ))
+if (( AGE > STALE_AFTER )); then
+    _fail "online sentinel is ${AGE}s old (>${STALE_AFTER}s threshold)"
+fi
+
+echo "HEALTHY: ready_connections=${CONNS} sentinel_age=${AGE}s"
+exit 0

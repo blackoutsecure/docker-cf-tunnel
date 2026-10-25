@@ -1,0 +1,41 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# svc-cf-tunnel/finish -- runs after cloudflared exits, before respawn.
+#
+# Argv:
+#   $1 -- exit code (or 256 if killed by a signal)
+#   $2 -- signal number (only meaningful when $1 == 256)
+#
+set -uo pipefail
+
+EXIT_CODE="${1:-0}"
+SIGNAL="${2:-0}"
+
+STATE_DIR="/run/cf-tunnel"
+MODE="$(cat "${STATE_DIR}/mode" 2>/dev/null || echo unknown)"
+
+# Pin stdio to PID 1 -- finish scripts inherit s6's stdio by default.
+exec >/proc/1/fd/1 2>/proc/1/fd/2
+
+if [[ "${EXIT_CODE}" == "256" ]]; then
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel[info]: cloudflared (mode=${MODE}) terminated by signal ${SIGNAL}"
+else
+    echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') svc-cf-tunnel[info]: cloudflared (mode=${MODE}) exited with code ${EXIT_CODE}"
+fi
+
+# Mark the sentinel as stale so the healthcheck reports unhealthy until
+# /ready returns 200 again. Touch with a far-past mtime.
+if [[ -f "${STATE_DIR}/online" ]]; then
+    touch -d "1970-01-01T00:00:00Z" "${STATE_DIR}/online" 2>/dev/null || rm -f "${STATE_DIR}/online"
+fi
+
+# When the entire container is being shut down (S6_SVSCANCTL=down), s6-svc
+# sets SVWAIT_DONE=1 so finish triggers `s6-svscanctl -t /run/service`
+# upstream. Don't fight it.
+if [[ "${EXIT_CODE}" != "256" ]] && [[ "${EXIT_CODE}" != "0" ]]; then
+    # cloudflared returns non-zero on auth failure / unknown tunnel /
+    # invalid token. Brief delay before respawn so we don't busy-loop a
+    # genuinely broken config across CrashLoopBackoff-style restarters.
+    sleep 5 || true
+fi
